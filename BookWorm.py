@@ -9,241 +9,346 @@ import wave
 import os
 import threading
 import time
-import select
-import sys
-import termios
-import tty
 from pathlib import Path
+import queue
+import collections
 
 class VoiceAI:
     def __init__(self):
-        print("Booting BookWorm")
+        print("Booting BookWorm...")
+        
+        # Load models
+        print("Loading Whisper model...")
         self.whisper_model = whisper.load_model("tiny")
-
+        
+        # Ollama settings
         self.ollama_url = "http://localhost:11434/api/generate"
-        self.ollama_model = "gemma3:1b"
-
-        self.system_prompt = """ You are a helpful voice assistant. Keep your responses concise and conversational since they will be spoken aloud. Aim for 1-3 sentences maximum unless specifically asked for detailed information. Be friendly and natural in your responses."""
-
+        self.ollama_model = "gemma2:2b"  # Faster than gemma3:1b
+        
+        # System prompt
+        self.system_prompt = """You are BookWorm, a helpful AI reading companion for children. Keep responses very short and friendly since they will be spoken aloud. Use simple words and 1-2 sentences maximum unless asked for details. Be encouraging about reading and learning."""
+        
+        # TTS settings
         self.piper_model_path = str(Path.home() / "voice-ai/piper-models/en_GB-semaine-medium.onnx")
-
+        
+        # Audio settings
         self.sample_rate = 16000
         self.channels = 1
-        self.recording = False
-        self.audio_data = []
-
-
-        print("Voice AI initialised successfully")
-        print("Controls:")
-        print(" SPACE - Hold to record, release to process")
-        print(" ESC - Quit Application")
+        self.chunk_duration = 1.0  # 1 second chunks for wake word detection
+        self.chunk_size = int(self.sample_rate * self.chunk_duration)
+        
+        # Wake word detection
+        self.wake_words = ["hey bookworm", "bookworm", "hey book"]
+        self.listening_for_wake_word = True
+        self.listening_for_command = False
+        self.wake_word_buffer = collections.deque(maxlen=3)  # 3 seconds of audio
+        
+        # Audio queues and threads
+        self.audio_queue = queue.Queue()
+        self.should_stop = False
+        
+        print("BookWorm initialized successfully!")
+        
+        # Pre-warm Ollama model
+        self.preload_ollama()
     
+    def preload_ollama(self):
+        """Pre-warm the Ollama model to reduce first response delay"""
+        print("Pre-warming Ollama model...")
+        try:
+            payload = {
+                "model": self.ollama_model,
+                "prompt": "Hello",
+                "stream": False,
+                "options": {"num_predict": 1}
+            }
+            requests.post(self.ollama_url, json=payload, timeout=10)
+            print("Ollama model ready!")
+        except Exception as e:
+            print(f"Warning: Could not pre-warm Ollama: {e}")
     
     def audio_callback(self, indata, frames, time, status):
-        """Callback function for audio recording"""
-        if self.recording:
-            self.audio_data.extend(indata[:, 0])
+        """Continuous audio callback for wake word detection"""
+        if not self.should_stop:
+            self.audio_queue.put(indata.copy())
     
-    def record_audio(self):
-        """Record audio until user presses enter again"""
-        print("\n🎤 Recording... (press ENTER again to stop)")
-        self.recording = True
-        self.audio_data = []
-        
-        # Start audio stream
-        stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            callback=self.audio_callback,
-            dtype=np.float32
-        )
-        
-        stream.start()
-        
-        # Wait for enter key press to stop
+    def detect_wake_word(self, audio_chunk):
+        """Simple wake word detection using Whisper"""
         try:
-            input()  # Wait for enter key
-        except:
-            pass
+            # Convert to temporary file for Whisper
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
+                with wave.open(temp_audio.name, 'wb') as wav_file:
+                    wav_file.setnchannels(self.channels)
+                    wav_file.setsampwidth(2)
+                    wav_file.setframerate(self.sample_rate)
+                    audio_int16 = (audio_chunk * 32767).astype(np.int16)
+                    wav_file.writeframes(audio_int16.tobytes())
+                
+                # Quick transcription with Whisper
+                result = self.whisper_model.transcribe(temp_audio.name, fp16=False)
+                text = result["text"].strip().lower()
+                
+                # Check for wake words
+                for wake_word in self.wake_words:
+                    if wake_word in text:
+                        os.unlink(temp_audio.name)
+                        return True
+                
+                os.unlink(temp_audio.name)
+                return False
+                
+        except Exception as e:
+            print(f"Wake word detection error: {e}")
+            return False
+    
+    def record_command_audio(self, duration=5):
+        """Record audio for command after wake word detected"""
+        print("🎤 Listening for your question...")
         
-        stream.stop()
-        stream.close()
+        audio_data = []
+        start_time = time.time()
         
-        self.recording = False
-        print("🛑 Recording stopped")
+        # Record for specified duration or until silence
+        while time.time() - start_time < duration:
+            try:
+                chunk = self.audio_queue.get(timeout=0.1)
+                audio_data.extend(chunk[:, 0])
+            except queue.Empty:
+                continue
         
-        return np.array(self.audio_data, dtype=np.float32)
+        return np.array(audio_data, dtype=np.float32)
     
     def speech_to_text(self, audio_data):
-        """Convert speech to text using Whisper"""
+        """Convert speech to text using Whisper - optimized version"""
         if len(audio_data) == 0:
             return ""
         
-        print("🔄 Converting speech to text...")
+        print("🔄 Processing your question...")
         
-        # Save audio to temporary file
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
-            # Write WAV file
-            with wave.open(temp_audio.name, 'wb') as wav_file:
-                wav_file.setnchannels(self.channels)
-                wav_file.setsampwidth(2)  # 16-bit
-                wav_file.setframerate(self.sample_rate)
-                # Convert float32 to int16
-                audio_int16 = (audio_data * 32767).astype(np.int16)
-                wav_file.writeframes(audio_int16.tobytes())
-            
-            # Use Whisper to transcribe
-            try:
-                result = self.whisper_model.transcribe(temp_audio.name)
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
+                with wave.open(temp_audio.name, 'wb') as wav_file:
+                    wav_file.setnchannels(self.channels)
+                    wav_file.setsampwidth(2)
+                    wav_file.setframerate(self.sample_rate)
+                    audio_int16 = (audio_data * 32767).astype(np.int16)
+                    wav_file.writeframes(audio_int16.tobytes())
+                
+                # Fast transcription with optimized settings
+                result = self.whisper_model.transcribe(
+                    temp_audio.name, 
+                    fp16=False,
+                    language="en",
+                    task="transcribe"
+                )
                 text = result["text"].strip()
-                print(f"📝 You said: '{text}'")
+                print(f"📝 You asked: '{text}'")
                 return text
-            except Exception as e:
-                print(f"❌ Speech recognition error: {e}")
-                return ""
-            finally:
-                # Clean up temp file
+                
+        except Exception as e:
+            print(f"❌ Speech recognition error: {e}")
+            return ""
+        finally:
+            try:
                 os.unlink(temp_audio.name)
+            except:
+                pass
     
-    def query_ollama(self, text):
-        """Send text to Ollama and get response"""
+    def query_ollama_streaming(self, text):
+        """Fast streaming response from Ollama"""
         print("🤖 Thinking...")
         
         try:
-            # Combine system prompt with user input
-            full_prompt = f"{self.system_prompt}\n\nUser: {text}\nAssistant:"
+            full_prompt = f"{self.system_prompt}\n\nChild: {text}\nBookWorm:"
             
             payload = {
                 "model": self.ollama_model,
                 "prompt": full_prompt,
-                "stream": False,
+                "stream": True,  # Enable streaming for faster response
                 "options": {
-                    "num_predict": 100,  # Limit response to ~100 tokens
-                    "temperature": 0.7,
+                    "num_predict": 50,  # Shorter responses
+                    "temperature": 0.8,
                     "top_p": 0.9,
-                    "stop": ["\n\nUser:", "User:", "\n\n"]  # Stop at conversation markers
+                    "stop": ["\n\nChild:", "Child:", "\n\n"]
                 }
             }
             
-            response = requests.post(self.ollama_url, json=payload, timeout=30)
+            response = requests.post(self.ollama_url, json=payload, stream=True, timeout=15)
             response.raise_for_status()
             
-            result = response.json()
-            ai_response = result.get("response", "").strip()
+            full_response = ""
+            for line in response.iter_lines():
+                if line:
+                    try:
+                        chunk = json.loads(line)
+                        if "response" in chunk:
+                            full_response += chunk["response"]
+                        if chunk.get("done", False):
+                            break
+                    except json.JSONDecodeError:
+                        continue
             
-            # Additional length limiting (fallback)
-            if len(ai_response) > 500:  # ~500 characters max
+            # Clean up response
+            ai_response = full_response.strip()
+            if len(ai_response) > 200:  # Keep it short for children
                 sentences = ai_response.split('. ')
-                if len(sentences) > 3:
-                    ai_response = '. '.join(sentences[:3]) + '.'
-                else:
-                    ai_response = ai_response[:500] + "..."
+                ai_response = '. '.join(sentences[:2]) + '.'
             
-            print(f"🤖 AI Response: {ai_response}")
+            print(f"🤖 BookWorm says: {ai_response}")
             return ai_response
             
-        except requests.exceptions.RequestException as e:
-            error_msg = f"Error connecting to Ollama: {e}"
-            print(f"❌ {error_msg}")
-            return error_msg
         except Exception as e:
-            error_msg = f"Unexpected error: {e}"
-            print(f"❌ {error_msg}")
+            error_msg = "Sorry, I'm having trouble thinking right now!"
+            print(f"❌ {error_msg}: {e}")
             return error_msg
     
-    def text_to_speech(self, text):
-        """Convert text to speech using Piper TTS"""
+    def text_to_speech_fast(self, text):
+        """Optimized text-to-speech"""
         if not text:
             return
         
-        print("🔊 Converting text to speech...")
+        print("🔊 Speaking...")
         
         try:
-            # Create temporary files for audio output
+            # Try Piper first (better quality)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
-                # Use Piper to generate speech
-                cmd = [
-                    "piper",
-                    "--model", self.piper_model_path,
-                    "--output_file", temp_audio.name
-                ]
+                cmd = ["piper", "--model", self.piper_model_path, "--output_file", temp_audio.name]
                 
-                # Run Piper with text input
-                process = subprocess.run(
-                    cmd,
-                    input=text,
-                    text=True,
-                    capture_output=True,
-                    check=True
-                )
+                process = subprocess.run(cmd, input=text, text=True, capture_output=True, timeout=10)
+                if process.returncode == 0:
+                    subprocess.run(["aplay", temp_audio.name], check=True, capture_output=True)
+                else:
+                    raise subprocess.CalledProcessError(process.returncode, cmd)
                 
-                # Play the generated audio
-                subprocess.run(["aplay", temp_audio.name], check=True)
-                print("✅ Speech playback completed")
-                
-        except subprocess.CalledProcessError as e:
-            print(f"❌ TTS Error: {e}")
-            # Fallback to espeak
-            print("🔄 Falling back to espeak...")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            # Fallback to espeak (faster)
+            print("🔄 Using fast speech...")
             try:
-                subprocess.run(["espeak", text], check=True)
-            except subprocess.CalledProcessError:
-                print("❌ Fallback TTS also failed")
+                subprocess.run(["espeak", "-s", "160", "-v", "en+f3", text], check=True, capture_output=True)
+            except:
+                print("❌ Speech failed")
+        
         except Exception as e:
-            print(f"❌ Unexpected TTS error: {e}")
+            print(f"❌ TTS error: {e}")
+        
         finally:
-            # Clean up temp files
             try:
                 if 'temp_audio' in locals():
                     os.unlink(temp_audio.name)
             except:
                 pass
     
-    def run(self):
-        """Main application loop"""
-        print("\nVoice AI is ready!")
-        print("Press ENTER to start talking...")
+    def startup_greeting(self):
+        """Greeting message on startup"""
+        greeting = "Hi there! I'm BookWorm, your reading companion. Say 'Hey BookWorm' whenever you want to chat about books!"
+        print(f"🤖 {greeting}")
+        self.text_to_speech_fast(greeting)
+    
+    def wake_word_listener(self):
+        """Main wake word detection loop"""
+        print("👂 Listening for 'Hey BookWorm'...")
+        
+        # Start continuous audio stream
+        stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=self.channels,
+            callback=self.audio_callback,
+            dtype=np.float32,
+            blocksize=self.chunk_size
+        )
+        
+        stream.start()
         
         try:
-            while True:
-                # Wait for user input
-                user_input = input("\nPress ENTER to record (or type 'q' to quit): ").strip().lower()
-                
-                if user_input == 'q':
-                    print("Goodbye!")
-                    break
-                
-                # Record audio
-                audio_data = self.record_audio()
-                
-                if len(audio_data) > 0:
-                    # Speech to text
-                    text = self.speech_to_text(audio_data)
+            while not self.should_stop:
+                try:
+                    # Get audio chunk
+                    audio_chunk = self.audio_queue.get(timeout=1.0)
+                    self.wake_word_buffer.append(audio_chunk)
                     
-                    if text:
-                        # Query LLM
-                        response = self.query_ollama(text)
+                    if len(self.wake_word_buffer) == self.wake_word_buffer.maxlen:
+                        # Combine buffer for wake word detection
+                        combined_audio = np.concatenate([chunk[:, 0] for chunk in self.wake_word_buffer])
                         
-                        # Text to speech
-                        self.text_to_speech(response)
-                    else:
-                        print("❌ No speech detected, try again")
-                
+                        # Check for wake word
+                        if self.detect_wake_word(combined_audio):
+                            print("✅ Wake word detected!")
+                            
+                            # Clear the queue of old audio
+                            while not self.audio_queue.empty():
+                                try:
+                                    self.audio_queue.get_nowait()
+                                except queue.Empty:
+                                    break
+                            
+                            # Record command
+                            command_audio = self.record_command_audio()
+                            
+                            # Process command
+                            if len(command_audio) > 0:
+                                text = self.speech_to_text(command_audio)
+                                if text and len(text.strip()) > 2:  # Ignore very short utterances
+                                    response = self.query_ollama_streaming(text)
+                                    self.text_to_speech_fast(response)
+                                else:
+                                    self.text_to_speech_fast("I didn't catch that. Try asking again!")
+                            
+                            print("👂 Listening for 'Hey BookWorm'...")
+                            
+                except queue.Empty:
+                    continue
+                except KeyboardInterrupt:
+                    break
+                except Exception as e:
+                    print(f"❌ Error in wake word loop: {e}")
+                    time.sleep(1)  # Brief pause before retrying
+                    
+        finally:
+            stream.stop()
+            stream.close()
+    
+    def run(self):
+        """Main application loop"""
+        print("\n🚀 BookWorm is starting up!")
+        
+        # Give startup greeting
+        self.startup_greeting()
+        
+        try:
+            # Start wake word detection
+            self.wake_word_listener()
+            
         except KeyboardInterrupt:
-            print("\n👋 Application interrupted. Goodbye!")
+            print("\n👋 BookWorm is going to sleep. Goodbye!")
         except Exception as e:
             print(f"❌ Application error: {e}")
         finally:
-            self.restore_terminal()
+            self.should_stop = True
+            print("BookWorm shutdown complete.")
 
-if __name__ == "__main__":
-    # Check if Piper model exists
+def check_dependencies():
+    """Check if required files and services exist"""
     piper_model = Path.home() / "voice-ai/piper-models/en_GB-semaine-medium.onnx"
     if not piper_model.exists():
-        print("❌ Piper model not found!")
-        print("Please download the model files as described in the setup instructions.")
+        print("⚠️ Piper model not found - will use espeak for TTS")
+    
+    # Test Ollama connection
+    try:
+        response = requests.get("http://localhost:11434/api/tags", timeout=5)
+        if response.status_code != 200:
+            print("⚠️ Ollama service not responding - please start it with 'ollama serve'")
+            return False
+    except requests.exceptions.RequestException:
+        print("⚠️ Cannot connect to Ollama - please start it with 'ollama serve'")
+        return False
+    
+    return True
+
+if __name__ == "__main__":
+    if not check_dependencies():
+        print("❌ Please fix dependencies before starting BookWorm")
         exit(1)
     
-    # Initialize and run the voice AI
+    # Initialize and run BookWorm
     voice_ai = VoiceAI()
     voice_ai.run()
