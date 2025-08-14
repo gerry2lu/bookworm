@@ -29,12 +29,12 @@ class VoiceAI:
         self.system_prompt = """You are BookWorm, a helpful AI reading companion for children. Keep responses very short and friendly since they will be spoken aloud. Use simple words and 1-2 sentences maximum unless asked for details. Be encouraging about reading and learning."""
         
         # TTS settings
-        self.piper_model_path = str(Path.home() / "voice-ai/piper-models/en_GB-semaine-medium.onnx")
+        self.piper_model_path = "/home/gerrylu/voice-ai/piper-models/en_GB-semaine-medium.onnx"
         
-        # Audio settings
-        self.sample_rate = 16000
+        # Audio settings - find supported sample rate
         self.channels = 1
         self.chunk_duration = 1.0  # 1 second chunks for wake word detection
+        self.sample_rate = self.find_supported_sample_rate()
         self.chunk_size = int(self.sample_rate * self.chunk_duration)
         
         # Wake word detection
@@ -51,6 +51,31 @@ class VoiceAI:
         
         # Pre-warm Ollama model
         self.preload_ollama()
+    
+    def find_supported_sample_rate(self):
+        """Find a sample rate supported by the audio device"""
+        common_rates = [44100, 48000, 22050, 16000, 8000]
+        
+        for rate in common_rates:
+            try:
+                # Test if this sample rate works
+                test_stream = sd.InputStream(
+                    samplerate=rate,
+                    channels=1,
+                    dtype=np.float32,
+                    blocksize=1024
+                )
+                test_stream.start()
+                test_stream.stop()
+                test_stream.close()
+                print(f"Using sample rate: {rate}Hz")
+                return rate
+            except Exception as e:
+                continue
+        
+        # Fallback to system default
+        print("Using system default sample rate")
+        return int(sd.default.samplerate)
     
     def preload_ollama(self):
         """Pre-warm the Ollama model to reduce first response delay"""
@@ -203,35 +228,57 @@ class VoiceAI:
             return error_msg
     
     def text_to_speech_fast(self, text):
-        """Optimized text-to-speech"""
+        """Optimized text-to-speech using Piper with espeak fallback"""
         if not text:
             return
         
         print("🔊 Speaking...")
         
         try:
-            # Try Piper first (better quality)
+            # Use Piper with your model
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
-                cmd = ["piper", "--model", self.piper_model_path, "--output_file", temp_audio.name]
+                cmd = [
+                    "piper",
+                    "--model", self.piper_model_path,
+                    "--output_file", temp_audio.name
+                ]
                 
-                process = subprocess.run(cmd, input=text, text=True, capture_output=True, timeout=10)
-                if process.returncode == 0:
-                    subprocess.run(["aplay", temp_audio.name], check=True, capture_output=True)
-                else:
-                    raise subprocess.CalledProcessError(process.returncode, cmd)
+                process = subprocess.run(
+                    cmd,
+                    input=text,
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=True
+                )
                 
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            # Fallback to espeak (faster)
-            print("🔄 Using fast speech...")
+                # Play the generated audio
+                subprocess.run(["aplay", temp_audio.name], check=True, capture_output=True)
+                
+        except subprocess.CalledProcessError as e:
+            print("🔄 Piper failed, using espeak fallback...")
             try:
-                subprocess.run(["espeak", "-s", "160", "-v", "en+f3", text], check=True, capture_output=True)
+                subprocess.run([
+                    "espeak", 
+                    "-s", "150",  # Speed
+                    "-v", "en+f3",  # Voice
+                    text
+                ], check=True, capture_output=True, timeout=10)
+            except Exception as fallback_error:
+                print(f"❌ All TTS methods failed: {fallback_error}")
+        
+        except subprocess.TimeoutExpired:
+            print("❌ Piper timeout, using espeak...")
+            try:
+                subprocess.run(["espeak", text], check=True, capture_output=True)
             except:
-                print("❌ Speech failed")
+                print("❌ Fallback TTS also failed")
         
         except Exception as e:
             print(f"❌ TTS error: {e}")
         
         finally:
+            # Clean up temp file
             try:
                 if 'temp_audio' in locals():
                     os.unlink(temp_audio.name)
@@ -328,9 +375,18 @@ class VoiceAI:
 
 def check_dependencies():
     """Check if required files and services exist"""
-    piper_model = Path.home() / "voice-ai/piper-models/en_GB-semaine-medium.onnx"
-    if not piper_model.exists():
-        print("⚠️ Piper model not found - will use espeak for TTS")
+    piper_model = "/home/gerrylu/voice-ai/piper-models/en_GB-semaine-medium.onnx"
+    if not Path(piper_model).exists():
+        print(f"⚠️ Piper model not found at {piper_model} - will use espeak for TTS")
+    else:
+        print("✅ Piper model found!")
+    
+    # Check if piper command exists
+    try:
+        subprocess.run(["piper", "--help"], capture_output=True, check=True)
+        print("✅ Piper command available!")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("⚠️ Piper command not found - will use espeak for TTS")
     
     # Test Ollama connection
     try:
@@ -338,6 +394,7 @@ def check_dependencies():
         if response.status_code != 200:
             print("⚠️ Ollama service not responding - please start it with 'ollama serve'")
             return False
+        print("✅ Ollama service ready!")
     except requests.exceptions.RequestException:
         print("⚠️ Cannot connect to Ollama - please start it with 'ollama serve'")
         return False
