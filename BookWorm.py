@@ -12,13 +12,27 @@ import time
 from pathlib import Path
 import queue
 import collections
+import pvporcupine
+import struct
 
 class VoiceAI:
     def __init__(self):
         print("Booting BookWorm...")
         
-        # Load models
-        print("Loading Whisper model...")
+        # Initialize Porcupine wake word detection
+        print("Loading Porcupine wake word detector...")
+        try:
+            self.porcupine = pvporcupine.create(
+                keywords=['computer'],  # Built-in keyword similar to "bookworm"
+                sensitivities=[0.5]     # Adjust sensitivity (0.0-1.0)
+            )
+            print("✅ Porcupine wake word detector loaded!")
+        except Exception as e:
+            print(f"❌ Failed to load Porcupine: {e}")
+            raise
+        
+        # Load Whisper only for speech-to-text (not wake word detection)
+        print("Loading Whisper model for speech recognition...")
         self.whisper_model = whisper.load_model("tiny.en")
         
         # Ollama settings
@@ -31,51 +45,27 @@ class VoiceAI:
         # TTS settings
         self.piper_model_path = "/home/gerrylu/voice-ai/piper-models/en_GB-semaine-medium.onnx"
         
-        # Audio settings - find supported sample rate
+        # Audio settings - Porcupine requires 16kHz
         self.channels = 1
-        self.chunk_duration = 1.0  # 1 second chunks for wake word detection
-        self.sample_rate = self.find_supported_sample_rate()
-        self.chunk_size = int(self.sample_rate * self.chunk_duration)
-        
-        # Wake word detection
-        self.wake_words = ["hey bookworm", "bookworm", "hey book"]
-        self.listening_for_wake_word = True
-        self.listening_for_command = False
-        self.wake_word_buffer = collections.deque(maxlen=3)  # 3 seconds of audio
+        self.sample_rate = self.porcupine.sample_rate  # Porcupine requires 16kHz
+        self.frame_length = self.porcupine.frame_length  # Porcupine frame size
         
         # Audio queues and threads
         self.audio_queue = queue.Queue()
         self.should_stop = False
         
+        print(f"Audio settings: {self.sample_rate}Hz, frame length: {self.frame_length}")
         print("BookWorm initialized successfully!")
         
         # Pre-warm Ollama model
         self.preload_ollama()
     
-    def find_supported_sample_rate(self):
-        """Find a sample rate supported by the audio device"""
-        common_rates = [44100, 48000, 22050, 16000, 8000]
-        
-        for rate in common_rates:
-            try:
-                # Test if this sample rate works
-                test_stream = sd.InputStream(
-                    samplerate=rate,
-                    channels=1,
-                    dtype=np.float32,
-                    blocksize=1024
-                )
-                test_stream.start()
-                test_stream.stop()
-                test_stream.close()
-                print(f"Using sample rate: {rate}Hz")
-                return rate
-            except Exception as e:
-                continue
-        
-        # Fallback to system default
-        print("Using system default sample rate")
-        return int(sd.default.samplerate)
+    def audio_callback(self, indata, frames, time, status):
+        """Audio callback for Porcupine wake word detection"""
+        if not self.should_stop:
+            # Convert float32 to int16 for Porcupine
+            audio_int16 = (indata[:, 0] * 32767).astype(np.int16)
+            self.audio_queue.put(audio_int16)
     
     def preload_ollama(self):
         """Pre-warm the Ollama model to reduce first response delay"""
@@ -92,36 +82,14 @@ class VoiceAI:
         except Exception as e:
             print(f"Warning: Could not pre-warm Ollama: {e}")
     
-    def audio_callback(self, indata, frames, time, status):
-        """Continuous audio callback for wake word detection"""
-        if not self.should_stop:
-            self.audio_queue.put(indata.copy())
-    
-    def detect_wake_word(self, audio_chunk):
-        """Simple wake word detection using Whisper"""
+    def detect_wake_word(self, audio_frame):
+        """Efficient wake word detection using Porcupine"""
         try:
-            # Convert to temporary file for Whisper
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
-                with wave.open(temp_audio.name, 'wb') as wav_file:
-                    wav_file.setnchannels(self.channels)
-                    wav_file.setsampwidth(2)
-                    wav_file.setframerate(self.sample_rate)
-                    audio_int16 = (audio_chunk * 32767).astype(np.int16)
-                    wav_file.writeframes(audio_int16.tobytes())
-                
-                # Quick transcription with Whisper
-                result = self.whisper_model.transcribe(temp_audio.name, fp16=False)
-                text = result["text"].strip().lower()
-                
-                # Check for wake words
-                for wake_word in self.wake_words:
-                    if wake_word in text:
-                        os.unlink(temp_audio.name)
-                        return True
-                
-                os.unlink(temp_audio.name)
-                return False
-                
+            # Porcupine expects exactly frame_length samples
+            if len(audio_frame) == self.frame_length:
+                keyword_index = self.porcupine.process(audio_frame)
+                return keyword_index >= 0  # Returns -1 if no keyword detected
+            return False
         except Exception as e:
             print(f"Wake word detection error: {e}")
             return False
@@ -133,15 +101,24 @@ class VoiceAI:
         audio_data = []
         start_time = time.time()
         
-        # Record for specified duration or until silence
-        while time.time() - start_time < duration:
+        # Clear any old audio from queue
+        while not self.audio_queue.empty():
             try:
-                chunk = self.audio_queue.get(timeout=0.1)
-                audio_data.extend(chunk[:, 0])
+                self.audio_queue.get_nowait()
             except queue.Empty:
-                continue
+                break
         
-        return np.array(audio_data, dtype=np.float32)
+        # Record fresh audio for the command
+        command_stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=self.channels,
+            dtype=np.float32
+        )
+        
+        with command_stream:
+            audio_data = command_stream.read(int(self.sample_rate * duration))[0]
+        
+        return audio_data[:, 0] if len(audio_data.shape) > 1 else audio_data
     
     def speech_to_text(self, audio_data):
         """Convert speech to text using Whisper - optimized version"""
@@ -293,21 +270,21 @@ class VoiceAI:
     
     def startup_greeting(self):
         """Greeting message on startup"""
-        greeting = "Hi there! I'm BookWorm, your reading companion. Say 'Hey BookWorm' whenever you want to chat about books!"
+        greeting = "Hi there! I'm BookWorm, your reading companion. Say 'Computer' whenever you want to chat about books!"
         print(f"🤖 {greeting}")
         self.text_to_speech_fast(greeting)
     
     def wake_word_listener(self):
-        """Main wake word detection loop"""
-        print("👂 Listening for 'Hey BookWorm'...")
+        """Efficient wake word detection loop using Porcupine"""
+        print("👂 Listening for wake word 'Computer'...")
         
-        # Start continuous audio stream
+        # Start audio stream with Porcupine-specific settings
         stream = sd.InputStream(
             samplerate=self.sample_rate,
             channels=self.channels,
             callback=self.audio_callback,
             dtype=np.float32,
-            blocksize=self.chunk_size
+            blocksize=self.frame_length
         )
         
         stream.start()
@@ -315,39 +292,30 @@ class VoiceAI:
         try:
             while not self.should_stop:
                 try:
-                    # Get audio chunk
-                    audio_chunk = self.audio_queue.get(timeout=1.0)
-                    self.wake_word_buffer.append(audio_chunk)
+                    # Get audio frame (int16 format for Porcupine)
+                    audio_frame = self.audio_queue.get(timeout=1.0)
                     
-                    if len(self.wake_word_buffer) == self.wake_word_buffer.maxlen:
-                        # Combine buffer for wake word detection
-                        combined_audio = np.concatenate([chunk[:, 0] for chunk in self.wake_word_buffer])
+                    # Check for wake word using Porcupine
+                    if self.detect_wake_word(audio_frame):
+                        print("✅ Wake word 'Computer' detected!")
                         
-                        # Check for wake word
-                        if self.detect_wake_word(combined_audio):
-                            print("✅ Wake word detected!")
-                            
-                            # Clear the queue of old audio
-                            while not self.audio_queue.empty():
-                                try:
-                                    self.audio_queue.get_nowait()
-                                except queue.Empty:
-                                    break
-                            
-                            # Record command
-                            command_audio = self.record_command_audio()
-                            
-                            # Process command
-                            if len(command_audio) > 0:
-                                text = self.speech_to_text(command_audio)
-                                if text and len(text.strip()) > 2:  # Ignore very short utterances
-                                    response = self.query_ollama_streaming(text)
-                                    self.text_to_speech_fast(response)
-                                else:
-                                    self.text_to_speech_fast("I didn't catch that. Try asking again!")
-                            
-                            print("👂 Listening for 'Hey BookWorm'...")
-                            
+                        # Brief pause to let user start speaking
+                        time.sleep(0.5)
+                        
+                        # Record command
+                        command_audio = self.record_command_audio()
+                        
+                        # Process command
+                        if len(command_audio) > 0:
+                            text = self.speech_to_text(command_audio)
+                            if text and len(text.strip()) > 2:  # Ignore very short utterances
+                                response = self.query_ollama_streaming(text)
+                                self.text_to_speech_fast(response)
+                            else:
+                                self.text_to_speech_fast("I didn't catch that. Try asking again!")
+                        
+                        print("👂 Listening for wake word 'Computer'...")
+                        
                 except queue.Empty:
                     continue
                 except KeyboardInterrupt:
@@ -359,6 +327,7 @@ class VoiceAI:
         finally:
             stream.stop()
             stream.close()
+            self.porcupine.delete()  # Clean up Porcupine resources
     
     def run(self):
         """Main application loop"""

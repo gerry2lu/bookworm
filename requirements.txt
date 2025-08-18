@@ -1,0 +1,5 @@
+whisper
+sounddevice
+numpy
+requests
+pvporcupine
