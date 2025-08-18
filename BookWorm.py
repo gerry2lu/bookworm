@@ -19,7 +19,7 @@ class VoiceAI:
         
         # Load models
         print("Loading Whisper model...")
-        self.whisper_model = whisper.load_model("tiny")
+        self.whisper_model = whisper.load_model("tiny.en")
         
         # Ollama settings
         self.ollama_url = "http://localhost:11434/api/generate"
@@ -249,8 +249,14 @@ class VoiceAI:
                     text=True,
                     capture_output=True,
                     timeout=10,
-                    check=True
                 )
+
+                if process.returncode != 0:
+                    print(f"🔄 Piper failed with return code {process.returncode}")
+                    print("Piper stdout:", process.stdout)
+                    print("Piper stderr:", process.stderr)
+                    raise subprocess.CalledProcessError(process.returncode, cmd)
+
                 
                 # Play the generated audio
                 subprocess.run(["aplay", temp_audio.name], check=True, capture_output=True)
