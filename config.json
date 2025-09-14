@@ -1,0 +1,151 @@
+{
+  "system": {
+    "name": "BookWorm Reading Facilitator",
+    "version": "2.0",
+    "debug_mode": false,
+    "max_errors_before_restart": 5
+  },
+  
+  "audio": {
+    "sample_rate": 16000,
+    "channels": 1,
+    "chunk_duration": 0.03,
+    "recording_duration": 5.0,
+    "vad_aggressiveness": 1,
+    "input_device": null,
+    "output_device": null
+  },
+  
+  "rfid": {
+    "enabled": true,
+    "debounce_time": 2.0,
+    "polling_interval": 0.1,
+    "simulation_mode": true,
+    "simulation_tags": ["BOOK001", "BOOK002", "BOOK003"]
+  },
+  
+  "speech_recognition": {
+    "model": "tiny.en",
+    "language": "en",
+    "no_speech_threshold": 0.6,
+    "temperature": 0,
+    "enable_preprocessing": true
+  },
+  
+  "llm": {
+    "url": "http://localhost:11434/api/generate",
+    "model": "gemma2:2b",
+    "max_tokens": 80,
+    "temperature": 0.8,
+    "timeout": 30,
+    "max_conversation_history": 10,
+    "context_window": 1024,
+    "system_prompt": "You are BookWorm, a friendly AI reading companion for children aged 6-12. Your role is to: help children with reading activities and book discussions, generate narrative continuations for stories, facilitate turn-taking between two children in reading activities, provide encouraging feedback about reading, and suggest books and reading games. Keep responses short (1-2 sentences max), age-appropriate and encouraging, focused on reading and stories, and interactive when appropriate. Never include formatting or special characters in responses as they will be spoken aloud."
+  },
+  
+  "tts": {
+    "primary_engine": "piper",
+    "piper_model_path": "/home/gerrylu/voice-ai/piper-models/en_GB-semaine-medium.onnx",
+    "fallback_to_espeak": false,
+    "speech_rate": 150,
+    "voice_variant": "en+f3",
+    "enable_prosody": true
+  },
+  
+  "responses": {
+    "thinking_responses": [
+      "Let me think about that...",
+      "Hmm, that's interesting...",
+      "Good question! Give me a moment...",
+      "I'm thinking...",
+      "Let me consider that...",
+      "What a great question...",
+      "Let me see..."
+    ],
+    
+    "greeting_messages": [
+      "BookWorm is ready! Place your book on the reader to start our conversation.",
+      "Hello! I'm BookWorm, your reading companion. Show me a book to begin!",
+      "Welcome! Touch your book to the reader and let's talk about stories!"
+    ],
+    
+    "error_messages": {
+      "no_speech": "I didn't hear anything. Try speaking a bit louder!",
+      "recording_failed": "I couldn't record your voice. Let's try again!", 
+      "processing_failed": "Let me think about that differently.",
+      "tts_failed": "I'm having trouble speaking right now.",
+      "connection_failed": "I'm having trouble thinking right now. Can you tell me about a story you like?"
+    },
+    
+    "fallback_responses": [
+      "That's interesting! Tell me more about what you're reading.",
+      "I love talking about books with you! What's your favorite story?",
+      "What a great question! I bet you can find some amazing books about that.",
+      "Tell me, what kind of books do you like to read?",
+      "That sounds like a wonderful topic for a story!"
+    ]
+  },
+  
+  "turn_taking": {
+    "enabled": true,
+    "max_turn_duration": 30,
+    "turn_transition_phrases": [
+      "Now it's your friend's turn to share!",
+      "What does your reading partner think?",
+      "Let's hear from the other reader!",
+      "Time to pass the story to your friend!"
+    ],
+    "encourage_sharing": true
+  },
+  
+  "narrative_generation": {
+    "enabled": true,
+    "story_continuation_prompts": [
+      "What do you think happens next in the story?",
+      "How would you continue this adventure?",
+      "What would you do if you were the main character?",
+      "Can you imagine what the character sees next?"
+    ],
+    "max_story_length": 150,
+    "encourage_creativity": true
+  },
+  
+  "logging": {
+    "enabled": true,
+    "log_level": "INFO",
+    "log_directory": "/home/gerrylu/voice-ai/logs",
+    "max_log_files": 10,
+    "include_audio_debug": false,
+    "include_conversation_log": true
+  },
+  
+  "safety": {
+    "content_filtering": true,
+    "child_safe_mode": true,
+    "max_session_duration": 1800,
+    "auto_timeout": true,
+    "inappropriate_content_response": "Let's talk about something from your books instead!"
+  },
+  
+  "hardware": {
+    "gpio_permissions_required": true,
+    "audio_buffer_size": 1024,
+    "rfid_pin_config": {
+      "sda": 21,
+      "scl": 20
+    },
+    "status_led": {
+      "enabled": false,
+      "pin": 18,
+      "brightness": 50
+    }
+  },
+  
+  "development": {
+    "simulation_mode": false,
+    "mock_rfid_events": false,
+    "mock_audio_input": false,
+    "verbose_logging": false,
+    "performance_monitoring": true
+  }
+}
